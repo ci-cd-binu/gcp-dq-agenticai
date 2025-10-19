@@ -25,109 +25,209 @@
 16. Appendices: sample JSONs, SQL, field schemas, prompt registry entry
 
 ---
+Here’s the **updated, fully aligned and deeply detailed version** of the requested section for **Doc-3**, ensuring total consistency with **Doc-2** and providing implementation-grade clarity.
+
+---
 
 ## 1. Executive summary
 
-This document gives an implementation-grade blueprint for replacing a legacy, static DQ gate (pre-transformation Ab Initio BDM checks) with an **agentic AI layer** built on Google Cloud. The system uses **GCP ADK + AgentSpace** for agents, **Vertex AI (Gemini)** for reasoning, **Dataplex / Data Catalog** for authoritative metadata + lineage, **BigQuery** as canonical store, and **Cloud Functions / Dataflow** as actionable MCP tool mechanisms. It covers agent lifecycle, state & memory management, RAG and embeddings, prompt engineering, integration patterns, safety/governance, monitoring, CI/CD practices, and the CrewAI portability addendum.
+This document presents an **implementation-grade blueprint** for transforming a legacy, static **Data Quality (DQ) gate**—originally implemented as **pre-transformation Ab Initio BDM checks**—into a **dynamic, autonomous Agentic AI layer** built entirely on **Google Cloud Platform (GCP)**.
+
+The goal is to move from **reactive DQ enforcement** to a **proactive, self-healing data pipeline** where intelligent agents continuously detect, reason about, and resolve data quality issues—within policy and governance boundaries—without human intervention in most low-risk scenarios.
+
+This Agentic AI framework leverages:
+
+* **GCP Agentic Development Kit (ADK)** and **AgentSpace** for multi-agent orchestration and lifecycle management.
+* **Vertex AI (Gemini)** for reasoning, explanation generation, and rule generalization.
+* **Dataplex and Data Catalog** as the authoritative metadata, lineage, and semantic context layer.
+* **BigQuery** as the canonical incident and long-term memory store.
+* **Cloud Functions / Dataflow** as the **MCP tools** layer for remediation and automation.
+* **Firestore** for transient agent state management and coordination.
+* **Pub/Sub + Cloud Run** for scalable event-driven operation.
+
+The architecture defines **seven cooperating agents** (Orchestrator, Detector, Explainer, Rule-Generator, Remediator, Feedback, and Governance), each responsible for a discrete functional role within the **DQ lifecycle**. These agents collaborate through **ADK-managed contracts**, ensuring separation of responsibilities, security enforcement, explainability, and HITL (Human-In-The-Loop) reinforcement learning.
+
+Additionally, this document includes:
+
+* Agent memory architecture (short-term vs long-term storage).
+* Integration with RAG (Retrieval-Augmented Generation) and embeddings for context.
+* Prompt engineering and governance strategies for explainability and safety.
+* Deployment, CI/CD, and observability patterns on GCP.
+* A **CrewAI portability addendum**, demonstrating how the solution can be adapted beyond GCP ADK while retaining agent semantics.
 
 ---
 
-## 2. AS-IS → TO-BE → Future-state evolution (enterprise view)
+## **2. AS-IS → TO-BE → Future-State Evolution (Enterprise View)**
 
-| Aspect              | AS-IS (Today)                                                             | TO-BE (This Project)                                                                                                  | Future-state (12–24mo)                                                                              |
-| ------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| DQ checks           | Ab Initio SQL/python scripts run pre-transform; fail stops medallion load | Agentic DQ layer: Detector Agent runs hybrid rule+LLM checks; Remediator suggests or executes fixes subject to policy | Self-healing pipelines: agents auto-resolve low-risk issues; predictive DQ scores prevent ingestion |
-| Governance          | Manual steward review; siloed rules                                       | Dataplex + AgentSpace + approval workflows; rules cataloged & versioned                                               | Auto-promotion of vetted AI-discovered rules to Dataplex policy library                             |
-| Context / semantics | Not captured; ad-hoc docs                                                 | RAG store: embeddings (past incidents, docs) + Data Catalog context                                                   | Cross-domain transfer learning; semantic rule reuse across datasets                                 |
-| State               | Logs + dashboards                                                         | Firestore (incident state), BigQuery (LTM, audit), Vertex Matching Engine (vectors)                                   | Temporal graph store for lineage + causal analytics                                                 |
-| Remediation         | Manual scripts                                                            | MCP Tools via Cloud Functions; staged dry-run + rollback support                                                      | Full automated remediation with roll-forward + roll-back SLOs                                       |
-| Monitoring          | Rule counts                                                               | LLM usage metrics, steward acceptance, incident MTTD/MTTR                                                             | Predictive SLO violation alerts and cost-aware scaling                                              |
-
----
-
-## 3. High-level architecture (narrative + component map)
-
-**Flow summary** (ingest → detect → reason → suggest/act → feedback):
-
-1. **Ingest & Preprocessing**: Data enters GCS / Pub/Sub → Dataflow → BigQuery staging (Ab Initio BDM or existing ETL may still run).
-2. **Baseline DQ**: Dataplex scheduled profiling + existing SQL checks produce DQ baseline metrics.
-3. **Event Trigger**: If thresholds or scheduled windows trigger, event to `dq-ingest` Pub/Sub topic → Cloud Run / API Gateway → Orchestrator Agent (ADK).
-4. **Detection**: Orchestrator calls Detector Agent (A2A). Detector runs deterministic checks (SQL) + LLM reasoning via Vertex AI (with RAG context from Matching Engine or BigQuery embeddings). Detector creates a `dq_incident` document in Firestore + entry in `dq_incidents` BigQuery table.
-5. **Explanation**: Explainer/Reasoner Agent reads incident + RAG context, returns human-friendly explanation (JSON with root_causes, confidence).
-6. **Remediation Proposal**: Remediator Agent generates remediation SQL or Dataflow template, runs **dry-run** in staging (BigQuery `dry_run`), stores diff, and posts into AgentSpace UI.
-7. **Governance/Approval**: Steward reviews in AgentSpace. Approve → Orchestrator triggers MCP Tools (Cloud Functions or Dataflow) to execute remediation; log everything. Reject/Modify → Feedback Agent updates memory and prompt registry.
-8. **Learn & Persist**: Approved remediation and steward feedback are turned into embeddings (LTM) and prompt tuning updates. Audit logs written to BigQuery.
-
-**Key GCP pieces**: BigQuery, Dataplex, Data Catalog, Dataflow, Pub/Sub, Cloud Run, Cloud Functions, Firestore (state), Vertex Matching Engine (prod embeddings) / BigQuery embeddings (POC), Vertex AI (Gemini), AgentSpace & ADK (agents), Cloud Monitoring / Logging, Secret Manager, Cloud DLP.
+| **Aspect**              | **AS-IS (Today)**                                                                                   | **TO-BE (This Project)**                                                                                                                         | **Future-State (12–24 months)**                                                                                                |
+| ----------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| **DQ Checks**           | Static Ab Initio SQL/Python scripts executed pre-transform. Threshold failure halts Medallion load. | **Agentic DQ Layer:** Detector Agent runs hybrid **rule-based + LLM** anomaly detection; Remediator proposes or executes policy-bound fixes.     | **Self-Healing Pipelines:** Agents autonomously resolve low-risk issues; predictive DQ scoring prevents ingestion of bad data. |
+| **Governance**          | Manual steward approvals; rules stored in silos.                                                    | **Dataplex + AgentSpace** workflow orchestration, versioned rule catalog, and steward review pipelines.                                          | Auto-promotion of AI-discovered rules to enterprise **Dataplex policy library**; adaptive governance.                          |
+| **Context / Semantics** | Limited documentation; no contextual inference.                                                     | **RAG store**: embeddings from prior incidents + Dataplex metadata provide semantic grounding.                                                   | Cross-domain **transfer learning** enables reusable DQ semantics across datasets.                                              |
+| **State Management**    | Logs and dashboards only; no state memory.                                                          | **Firestore** for short-term task states; **BigQuery** for long-term incidents and audit logs; **Vertex Matching Engine** for vector embeddings. | Temporal knowledge graph store linking lineage, causal relationships, and data behavior patterns.                              |
+| **Remediation**         | Manual SQL scripting or re-runs of failed ETL jobs.                                                 | **MCP tools** via Cloud Functions or Dataflow; agents generate and dry-run remediations with rollback support.                                   | **Fully automated remediation** with roll-forward/rollback SLAs and compliance approval logic.                                 |
+| **Monitoring**          | Rule pass/fail counts only.                                                                         | Track LLM usage metrics, steward acceptance rates, and incident **MTTD/MTTR**.                                                                   | Predictive alerts for **SLO violations**; **cost-aware scaling** for AI calls.                                                 |
 
 ---
 
-## 4. Agents — taxonomy, responsibilities, API contracts
+## **3. High-Level Architecture (Narrative + Component Map)**
 
-### 4.1 Orchestrator Agent
+### **End-to-End Flow: Ingest → Detect → Reason → Suggest/Act → Learn**
 
-* **Purpose**: Entry point for DQ runs, routing, priority decisions, policy enforcement.
-* **Inputs**: Ingestion event (dataset, job_id, timestamp) or steward request.
-* **Outputs**: Dispatch tasks (Detector), aggregate results, drive approval flows.
-* **Tools**: ADK orchestrator runtime, Firestore (state write), Pub/Sub, Vertex AI for intent parsing.
-* **Contract** (example):
+1. **Ingest & Preprocessing**
+
+   * Data enters via **GCS / Pub/Sub**, then flows through **Dataflow → BigQuery Staging**.
+   * Legacy **Ab Initio BDM** checks may still run, but only as baseline support.
+   * Metadata captured in **Dataplex / Data Catalog** for lineage and schema versioning.
+
+2. **Baseline DQ Profiling**
+
+   * **Dataplex scheduled profiling jobs** and static SQL checks produce reference-quality metrics.
+   * These form part of the RAG context for the Detector Agent.
+
+3. **Event Trigger**
+
+   * Threshold breaches, time windows, or ingestion events emit messages to **dq-ingest Pub/Sub topic**.
+   * A **Cloud Run** service invokes the **Orchestrator Agent** via ADK APIs.
+
+4. **Detection (Detector Agent)**
+
+   * The **Orchestrator** delegates dataset and check context to the **Detector Agent**.
+   * Detector executes:
+     a. Deterministic SQL checks (partition-aware, metadata-driven).
+     b. **Dataplex profiling API** calls.
+     c. **Vertex AI (Gemini)** reasoning for contextual anomaly detection using embedded schema and sample rows.
+   * Detected issues are recorded as **dq_incident documents** in **Firestore** and persisted in **BigQuery**.
+
+5. **Explanation (Explainer / Reasoner Agent)**
+
+   * The **Explainer Agent** uses dq_incident details + **RAG context** (prior incidents, catalog metadata, lineage docs).
+   * It generates structured **explanations** with probable root causes, confidence scores, and investigative guidance.
+
+6. **Remediation Proposal (Remediator Agent)**
+
+   * Suggests remediation actions (SQL fix, Dataflow reprocessing, DLP cleansing).
+   * Executes **dry-run** with BigQuery dry_run API to produce diffs.
+   * Stores remediation proposal in **AgentSpace UI** for review.
+
+7. **Governance & Approval (Governance + Orchestrator)**
+
+   * Steward reviews proposals.
+   * Approval triggers MCP Tool (Cloud Function or Dataflow job) for actual remediation.
+   * All activity is logged to BigQuery (audit).
+
+8. **Learning Loop (Feedback Agent)**
+
+   * Approved remediations, steward rejections, and reasoning traces are converted to embeddings (Vertex Matching Engine).
+   * Prompts and rules are fine-tuned through the **Prompt Registry**.
+   * Over time, the system evolves from reactive → proactive → self-healing.
+
+---
+
+### **Core GCP Components**
+
+| **Category**                  | **GCP Tools / Services**                                    |
+| ----------------------------- | ----------------------------------------------------------- |
+| **Data & Metadata**           | BigQuery, Dataplex, Data Catalog                            |
+| **Processing & Remediation**  | Dataflow, Cloud Functions, Cloud Run                        |
+| **Messaging / Orchestration** | Pub/Sub, ADK Orchestrator Runtime                           |
+| **AI & Reasoning**            | Vertex AI (Gemini Pro), Vertex Matching Engine (embeddings) |
+| **State / Memory**            | Firestore (short-term), BigQuery (long-term LTM)            |
+| **Security / Governance**     | Cloud DLP, IAM Policies, Cloud Audit Logs                   |
+| **Observability**             | Cloud Monitoring, Logging, Secret Manager                   |
+| **Interface / Collaboration** | AgentSpace Console for HITL workflows                       |
+
+---
+
+## **4. Agents — Taxonomy, Responsibilities, API Contracts**
+
+This section aligns fully with **Doc-2** and includes the expanded implementation-level clarity.
+
+### **4.1 Orchestrator Agent**
+
+* **Purpose:** Entry point for DQ runs, routing, priority handling, policy enforcement.
+* **Inputs:** Ingestion event or steward request.
+* **Outputs:** Task delegation (to Detector), aggregation, approval orchestration.
+* **Tools:** ADK runtime, Firestore (state), Pub/Sub, Vertex AI (intent parsing).
+* **API Contract Example:**
 
   ```json
   {
-    "task_id":"orch-20251018-001",
-    "dataset":"billing.prod_charges",
-    "trigger":"ingest_event",
-    "priority":"high",
-    "requested_checks":["null_rate","duplicates","temporal"]
+    "task_id": "orch-20251018-001",
+    "dataset": "billing.prod_charges",
+    "trigger": "ingest_event",
+    "priority": "high",
+    "requested_checks": ["null_rate", "duplicates", "temporal"]
   }
   ```
 
-### 4.2 Detector Agent (DQ Detector)
+---
 
-* **Purpose**: Execute checks (SQL templates + Dataplex profiles) and produce structured incidents.
-* **Actions**:
+### **4.2 Detector Agent (DQ Detector)**
 
-  * Run deterministic SQL checks (partition-aware).
-  * Run Dataplex profiling if configured.
-  * Call Vertex AI for contextual detection (send canonicalized sample + schema).
-* **Outputs**: `dq_incident` JSON stored in Firestore + BigQuery.
-* **Sample SQL check**: null rate per partition.
-* **Safety**: Read-only for data; writes to incident stores only.
+* **Purpose:** Execute hybrid deterministic and LLM-driven DQ checks.
+* **Actions:**
 
-### 4.3 Explainer / Reasoner Agent
+  * Run SQL templates parameterized by metadata.
+  * Invoke Dataplex profiling APIs.
+  * Call Vertex AI for contextual reasoning using sample+schema embeddings.
+* **Outputs:** `dq_incident` JSON → Firestore + BigQuery.
+* **Safety:** Read-only access; only writes to incident stores.
 
-* **Purpose**: Convert raw detection into high-value explanations & root-cause hypotheses.
-* **Inputs**: `dq_incident` id, RAG context (catalog text, previous incidents, business rules).
-* **Outputs**: Explanation JSON as:
+---
+
+### **4.3 Explainer / Reasoner Agent**
+
+* **Purpose:** Translate incidents into explanations and root-cause hypotheses.
+* **Inputs:** dq_incident ID + RAG context.
+* **Outputs:**
 
   ```json
   {
-    "incident_id":"",
-    "summary":"",
-    "root_causes":[{"cause":"","confidence":0.7}],
-    "investigation_steps":[...],
-    "references":[...]
+    "incident_id": "",
+    "summary": "",
+    "root_causes": [{"cause": "", "confidence": 0.7}],
+    "investigation_steps": [],
+    "references": []
   }
   ```
 
-### 4.4 Rule-Generator Agent
+---
 
-* **Purpose**: Suggest formalizable rules (for Dataplex / BigQuery) given recurring incidents.
-* **Work**: Batch job that analyzes repeated patterns in `dq_incidents` LTM, proposes SQL checks with estimated FP/FN.
+### **4.4 Rule-Generator Agent**
 
-### 4.5 Remediator Agent
+* **Purpose:** Suggest new formalized Dataplex/BigQuery rules by mining recurring incident patterns.
+* **Mechanism:** Analyze dq_incidents LTM → propose SQL rule templates → estimate FP/FN and steward approval.
 
-* **Purpose**: Propose remediation (SQL/Dataflow/connector calls), run dry-run, provide rollback script.
-* **Safety**: Must run dry-run, produce diff and rollback before any production write.
-* **Execution options**: (a) generate artifact for steward approval, (b) for low-risk tasks auto-execute with policy.
+---
 
-### 4.6 Feedback Agent (HITL learning)
+### **4.5 Remediator Agent**
 
-* **Purpose**: Capture steward decisions, map to LTM and Prompt Registry updates, supervise fine-tuning triggers.
+* **Purpose:** Generate remediation scripts or pipelines (SQL/Dataflow), run dry-runs, provide rollback script.
+* **Safety:** Always dry-run first; human approval needed for medium/high-risk.
+* **Execution Modes:**
 
-### 4.7 Governance Agent
+  * (a) Steward approval required.
+  * (b) Auto-execute for low-risk, pre-approved datasets.
 
-* **Purpose**: Enforce policy (PII, no auto-write for billing without 2 approvals), call Cloud DLP for redaction, manage audit logs.
+---
+
+### **4.6 Feedback Agent (HITL Learning)**
+
+* **Purpose:** Capture steward feedback, trigger prompt/LTM updates.
+* **Functions:**
+
+  * Update incident vector embeddings.
+  * Register new examples for fine-tuning.
+  * Maintain Prompt Registry version history.
+
+---
+
+### **4.7 Governance Agent**
+
+* **Purpose:** Enforce policies, ensure compliance and transparency.
+* **Tools:** Cloud DLP, IAM, Cloud Audit Logs.
+* **Responsibilities:** Prevent unsafe remediation; manage PII redaction; log all AI decisions.
 
 ---
 
