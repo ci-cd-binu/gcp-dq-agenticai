@@ -1,0 +1,277 @@
+# Data Governance & Dataplex Integration**
+
+### *Metadata Management, Policy Alignment & Operational Governance for Agentic AI DQ Systems*
+
+---
+
+## **1. Executive Summary**
+
+This document defines the **governance and metadata integration layer** for the Agentic AI–driven Data Quality (DQ) system described in Doc-2 (Implementation Deep Dive) and Doc-3 (Prompt Engineering & Fine-Tuning).
+It operationalizes the **policy, lineage, and compliance foundations** of the system using **Google Cloud Dataplex**, **Data Catalog**, and **AgentSpace governance hooks**.
+
+Specifically, this Doc explains how:
+
+* Governance agents enforce compliance with **PII, data access, and remediation approval policies**.
+* **Dataplex** serves as the **control plane for metadata, lineage, and rule versioning**.
+* **Data Catalog** provides semantic grounding and context for all AI-driven DQ decisions.
+* **Feedback loops** are built into the Dataplex metadata model so that **approved AI-discovered rules** can auto-promote into production policies.
+* **Operational dashboards and observability** are designed to align with enterprise audit and cost monitoring frameworks.
+
+Outcome:
+The DQ platform evolves from static, script-based controls to an **adaptive, metadata-driven governance mesh**, ensuring every detection, explanation, and remediation is **traceable, policy-compliant, and auditable**.
+
+---
+
+## **2. Governance Goals**
+
+| Dimension            | Legacy Governance (AS-IS)          | Agentic AI Governance (TO-BE)                   | Future-State                                        |
+| -------------------- | ---------------------------------- | ----------------------------------------------- | --------------------------------------------------- |
+| **Rule management**  | Rules defined in Ab Initio scripts | Rules managed as Dataplex metadata artifacts    | Auto-promotion of AI-generated rules                |
+| **Approval process** | Manual steward sign-off            | AgentSpace + Governance Agent approval workflow | Federated approvals with explainability             |
+| **Lineage**          | Minimal; schema-based only         | Dataplex lineage API integration                | Temporal causal lineage graphs                      |
+| **Metadata scope**   | Technical schema only              | Business + operational + AI metadata            | Cross-domain semantic graph                         |
+| **Audit**            | Log dumps                          | BigQuery audit tables, policy traceability      | Graph-based trust analytics                         |
+| **Compliance**       | Manual tagging                     | Automated via DLP + Dataplex tags               | Continuous classification & auto-policy enforcement |
+
+---
+
+## **3. Architecture Integration Overview**
+
+### **3.1 Conceptual View**
+
+```
+[Data Producer] → [Ingestion → DQ Agentic Layer → Steward Portal]
+                        ↓
+                   [Dataplex Control Plane]
+                        ↓
+              [Data Catalog + Policy Registry]
+                        ↓
+        [Governance Agent + DLP + Audit + Feedback]
+```
+
+### **3.2 Key Components**
+
+| Component                | Function                                                                                         |
+| ------------------------ | ------------------------------------------------------------------------------------------------ |
+| **Dataplex**             | Central governance control plane for data lakes; manages metadata, classification, and policies. |
+| **Data Catalog**         | Semantic store linking datasets, rules, incidents, and lineage.                                  |
+| **Governance Agent**     | AI-driven agent that enforces policy checks, manages approvals, and logs compliance events.      |
+| **Cloud DLP**            | Automated detection/redaction of PII and sensitive fields.                                       |
+| **AgentSpace**           | UI for stewards to review incidents, approve remediations, and manage policy rules.              |
+| **BigQuery Audit Store** | Canonical record of every rule execution, decision, and steward action.                          |
+
+---
+
+## **4. Dataplex Integration Patterns**
+
+### **4.1 Metadata Model Extension**
+
+Each DQ incident and rule is represented in Dataplex as an **extended metadata entity**:
+
+| Field              | Example                                   | Description                    |
+| ------------------ | ----------------------------------------- | ------------------------------ |
+| `dq_rule_id`       | `DQ_R001`                                 | Unique rule identifier         |
+| `rule_text`        | `"Check null rate < 2% for billing_date"` | SQL or natural-language rule   |
+| `source_dataset`   | `billing.prod_charges`                    | Dataset identifier             |
+| `ai_discovered`    | `true`                                    | Indicates if generated by AI   |
+| `steward_approval` | `approved_by=“data_governance_team”`      | Governance metadata            |
+| `policy_ref`       | `dataplex://policy/pii_redact`            | Reference to associated policy |
+| `lineage_links`    | `[source_feed, downstream_table]`         | Lineage metadata               |
+
+These are automatically synced into Dataplex via **Dataplex Metadata APIs** from the Governance Agent.
+
+---
+
+### **4.2 Dataplex Policy Enforcement Workflow**
+
+1. **Agent triggers detection** → DQ incident created.
+2. **Governance Agent** reads associated Dataplex policy tags (e.g., *PII = true*, *financial = true*).
+3. **Policy evaluation**:
+
+   * If *auto-remediation allowed = false* → Steward approval required.
+   * If *sensitivity level = low* → Auto-remediation permitted.
+4. **Steward approval** or **Governance override** recorded as a Dataplex metadata update.
+5. **Audit entry** written to BigQuery.
+
+Example Policy YAML:
+
+```yaml
+policy_id: dq_remediation_policy
+rules:
+  - condition: sensitivity == "PII"
+    action: require_approval
+  - condition: sensitivity == "public"
+    action: auto_remediate
+  - condition: dataset_owner == "finance"
+    action: notify_cfo
+```
+
+---
+
+### **4.3 Dataplex Rule Lifecycle**
+
+| Phase        | Trigger                   | Responsible Agent     | Dataplex Action               |
+| ------------ | ------------------------- | --------------------- | ----------------------------- |
+| **Discover** | Repeated incident pattern | Rule-Generator Agent  | Propose new rule metadata     |
+| **Review**   | Steward validation        | Governance Agent + UI | Create draft policy           |
+| **Promote**  | Approval                  | Governance Agent      | Update Dataplex rule registry |
+| **Monitor**  | Execution feedback        | Orchestrator Agent    | Log metrics & lineage         |
+| **Retire**   | Obsolete or failed        | Governance Agent      | Deprecate metadata entry      |
+
+---
+
+## **5. Data Catalog Integration**
+
+### **5.1 Catalog Contextualization**
+
+Each **dq_incident** is linked to:
+
+* The **dataset entry** in Data Catalog,
+* The **rule metadata** in Dataplex,
+* The **lineage** of upstream and downstream dependencies.
+
+The **Reasoner Agent** uses the Catalog API to fetch:
+
+* Descriptions and business glossaries,
+* Tag templates (e.g., domain = billing, owner = finance),
+* Prior incidents on same entity (context for RAG).
+
+### **5.2 Tag Templates Example**
+
+```yaml
+template_id: dq_metadata_tags
+fields:
+  dq_severity: ENUM(CRITICAL, HIGH, MEDIUM, LOW)
+  dq_confidence: FLOAT
+  steward: STRING
+  ai_discovered: BOOL
+  last_reviewed: TIMESTAMP
+```
+
+These tags appear in the Data Catalog UI and are queryable via SQL through BigQuery’s **INFORMATION_SCHEMA.TAG_FIELDS** view.
+
+---
+
+## **6. Governance Agent — Design Details**
+
+### **6.1 Responsibilities**
+
+| Area                      | Description                                                           |
+| ------------------------- | --------------------------------------------------------------------- |
+| **Policy enforcement**    | Checks Dataplex metadata to decide if action needs approval           |
+| **DLP integration**       | Invokes Cloud DLP for PII redaction before sending sample data to LLM |
+| **Audit management**      | Creates compliance logs in BigQuery                                   |
+| **Steward orchestration** | Coordinates with AgentSpace for human review                          |
+| **Feedback loop**         | Updates Dataplex metadata when policies are promoted                  |
+
+### **6.2 Key API Flow**
+
+1. `dq_incident_detected` → event → Governance Agent.
+2. Governance Agent calls:
+
+   * `GET /dataplex/v1/entities/{dataset}`
+   * `GET /dataplex/v1/policies/{policy_id}`
+3. Evaluates policy JSON → decision = auto / manual / reject.
+4. Calls Cloud DLP if necessary → redacts sample payload.
+5. Posts review task in AgentSpace (Pub/Sub event).
+6. Writes audit log → BigQuery → triggers Looker dashboard refresh.
+
+---
+
+## **7. Operational Governance Flows**
+
+### **7.1 Steward Approval Lifecycle**
+
+```
+[Detector Agent] 
+   ↓
+[Governance Agent]
+   ↓
+[AgentSpace UI] — steward approves/rejects
+   ↓
+[Feedback Agent + Dataplex Metadata Update]
+   ↓
+[Audit Store]
+```
+
+### **7.2 Automated Policy Promotion**
+
+When multiple incidents of the same type receive identical steward remediations:
+
+1. Rule-Generator Agent synthesizes a generalized rule.
+2. Governance Agent validates and submits as a *draft policy* in Dataplex.
+3. If approved → auto-promotion into the Dataplex policy registry.
+4. Dataplex propagates rule → new DQ baseline.
+
+This creates a **self-reinforcing governance system** — every human decision strengthens automated policy.
+
+---
+
+## **8. Auditing & Monitoring**
+
+### **8.1 BigQuery Audit Schema**
+
+| Field         | Type      | Description                            |
+| ------------- | --------- | -------------------------------------- |
+| `event_id`    | STRING    | Unique audit event                     |
+| `agent_id`    | STRING    | Orchestrator / Detector / Governance   |
+| `action_type` | STRING    | detect / explain / remediate / approve |
+| `steward_id`  | STRING    | Reviewer                               |
+| `decision`    | STRING    | approve / reject / auto                |
+| `timestamp`   | TIMESTAMP | Event time                             |
+| `policy_ref`  | STRING    | Dataplex policy link                   |
+
+### **8.2 Dashboards**
+
+* **Steward Productivity Dashboard:** incidents reviewed, turnaround time, approval rates.
+* **Policy Drift Dashboard:** difference between AI-discovered vs. approved rules.
+* **Compliance Dashboard:** datasets by sensitivity class, ungoverned %.
+
+All metrics sourced from **BigQuery audit tables + Dataplex policy inventory**.
+
+---
+
+## **9. Security and Compliance Controls**
+
+* **PII Protection:** enforced via Cloud DLP classification + tokenization.
+* **Least Privilege:** IAM separation for each agent role.
+* **VPC-SC:** ensures LLM calls and Dataplex metadata exchange stay within GCP perimeter.
+* **Key Management:** Cloud KMS for encryption of incident payloads.
+* **Model Audit:** Vertex AI model cards versioned and linked in Catalog.
+
+---
+
+## **10. Integration with CI/CD and MLOps**
+
+* Dataplex policy and Data Catalog templates versioned in **Cloud Source Repos**.
+* Governance Agent automatically validates metadata JSON schema pre-merge.
+* **Cloud Build pipelines** push approved Dataplex policies to staging and prod environments.
+* Every promotion triggers a **Policy Validation Run**, generating compliance metrics.
+
+---
+
+## **11. Future-State Evolution**
+
+| Horizon    | Focus                    | Description                                       |
+| ---------- | ------------------------ | ------------------------------------------------- |
+| **+6 mo**  | Automated rule discovery | Agents propose new Dataplex policies autonomously |
+| **+12 mo** | Graph-based lineage      | Temporal graph of datasets → causal DQ analytics  |
+| **+18 mo** | Predictive governance    | Policy violations predicted before ingestion      |
+| **+24 mo** | Enterprise mesh          | Federation across domains, unified semantic graph |
+
+---
+
+## **12. Summary**
+
+Doc-4 defines how **governance becomes a dynamic participant** in the Agentic AI ecosystem — not an afterthought.
+Through **Dataplex + Data Catalog + Governance Agents**, enterprises achieve:
+
+* **Adaptive metadata-driven compliance,**
+* **Traceable DQ lineage,**
+* **Self-evolving rule intelligence,**
+* **Federated governance visibility across domains.**
+
+This closes the loop between *autonomous AI operations* and *human policy oversight*, ensuring trust, transparency, and auditability across the data lifecycle.
+
+---
+
