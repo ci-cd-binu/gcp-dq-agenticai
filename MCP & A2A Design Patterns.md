@@ -315,4 +315,175 @@ It ensures:
 
 This design forms the **foundation of next-generation agentic architectures** — scalable, observable, and governed.
 
+# **Doc-5 Addendum: Likely Interview Questions & Whiteboard Prompts — MCP & A2A Design Patterns**
+
+---
+
+### **1. Conceptual Grounding**
+
+**Q1. What does MCP mean in the context of your GenAI Data Quality solution?**
+**A:** MCP stands for **Multi-Agent Control Plane** — it’s the layer that coordinates interactions among agents (Detector, Remediator, Feedback, Governance). It standardizes communication, manages context propagation, handles safety/policy enforcement, and tracks execution state. Essentially, it’s what turns a collection of independent agents into a **coherent, governed system** rather than ad-hoc LLM calls.
+
+---
+
+**Q2. Why is an MCP required instead of letting agents directly call each other (A2A)?**
+**A:** Direct A2A works for small PoCs but doesn’t scale. Without MCP, you lose **traceability, throttling, role isolation, and failure recovery**. MCP adds:
+
+* A **shared state store** (Firestore + Pub/Sub topics)
+* **Uniform schema contracts** between agents
+* **Queue-based orchestration** for retries and concurrency
+* Centralized **audit & DLP policies**
+
+In short: A2A = local autonomy; MCP = enterprise governance.
+
+---
+
+**Q3. What are the core components of your MCP implementation?**
+**A:**
+
+1. **Orchestrator Layer** → built using GCP ADK Orchestrator + Cloud Run
+2. **Task Bus** → Pub/Sub with schema-validated payloads
+3. **State Store** → Firestore (short-term), BigQuery (long-term audit)
+4. **Policy Filter** → Cloud Functions intercept layer invoking DLP / IAM check
+5. **Metrics Hooks** → Cloud Monitoring + custom LLM token usage logs
+6. **Agent Registry** → Firestore collection + Dataplex metadata for versioning
+
+---
+
+### **2. A2A Patterns**
+
+**Q4. How do agents communicate with each other — synchronous or asynchronous?**
+**A:** Mostly **asynchronous** via Pub/Sub topics. Each agent has a subscription to the MCP’s task bus with a **topic prefix** like `dq.detector.task` or `dq.remediator.task`.
+For **real-time feedback loops** (e.g., rule suggestion → approval → apply), a **temporary direct A2A gRPC channel** is created using ADK’s session context.
+
+---
+
+**Q5. How is state and memory passed between agents?**
+**A:**
+
+* **Short-term state (STM):** Firestore documents — e.g., incident_id, dataset_id, last action.
+* **Long-term memory (LTM):** BigQuery tables + Vertex Matching Engine embeddings (for RAG context).
+* **RAG context propagation:** Orchestrator injects prior incident embeddings + relevant catalog text into the next agent’s prompt envelope.
+
+---
+
+**Q6. What GCP ADK classes or components were used to build these A2A links?**
+**A:**
+
+* `AgentOrchestrator` (manages context, policies)
+* `TaskHandler` (per agent class)
+* `A2AConnector` (for controlled direct handoffs)
+* `MemoryStore` (abstraction over Firestore + Vertex Matching Engine)
+* `PromptRegistry` (versioned templates and HITL prompts)
+
+---
+
+**Q7. How do you handle agent retries, idempotency, and error isolation?**
+**A:**
+
+* Each agent publishes structured `status` events (`pending`, `completed`, `error`) to Pub/Sub.
+* The MCP assigns a **correlation ID** per workflow run.
+* Failures are retried with exponential backoff (Cloud Tasks).
+* Agents are **idempotent** — no double writes; state transitions recorded in Firestore.
+
+---
+
+### **3. Whiteboard-Style “Explain Live” Questions**
+
+**Q8. Walk me through a complete A2A interaction — say Detector → Remediator → Feedback.**
+**A:**
+
+1. **Detector Agent** identifies a DQ issue → writes `dq_incident` to Firestore + publishes event to `dq.incident.detected`.
+2. **MCP Policy Filter** checks dataset sensitivity (via Dataplex tags).
+3. **Remediator Agent** picks event → drafts SQL remediation (dry-run) → posts diff to Firestore.
+4. **Feedback Agent** listens to `dq.remediation.proposed`, captures steward approval via AgentSpace UI.
+5. On approval → **Orchestrator** invokes Cloud Function (MCP Tool) to apply fix.
+6. Results logged → embeddings updated in LTM.
+
+You can draw it as a **Pub/Sub event chain** with Firestore as sidecar state.
+
+---
+
+**Q9. How do you maintain context between agents (memory consistency)?**
+**A:**
+
+* Each agent references the **same `task_id`** in Firestore.
+* The Orchestrator merges agent responses into a composite object.
+* Prompt context = last N incidents + steward notes from Feedback Agent (RAG context).
+* Vertex Matching Engine indexes embeddings; retrieval ensures semantic continuity across A2A flows.
+
+---
+
+**Q10. What’s your approach for performance and concurrency control in multi-agent runs?**
+**A:**
+
+* Limit 1:1 agent concurrency via Pub/Sub push subscription quotas.
+* Use **Cloud Run revisions** for horizontal scaling.
+* Deploy async jobs with **Cloud Tasks** to throttle throughput.
+* Token + cost metrics sent to Cloud Monitoring dashboards.
+
+---
+
+### **4. Safety, Governance, and CI/CD**
+
+**Q11. How do you ensure one rogue agent doesn’t perform unauthorized actions?**
+**A:**
+
+* Every agent has a **service account with scoped IAM roles** (principle of least privilege).
+* Governance Agent inspects action manifests before execution.
+* Any `write` operation triggers a DLP scan via Cloud DLP API.
+* Manual approval required for high-risk datasets (billing, PII).
+
+---
+
+**Q12. How do you test or simulate MCP interactions?**
+**A:**
+
+* Use **ADK’s Agent Emulator** for dry runs.
+* Pub/Sub replay mode for event-driven tests.
+* Mocked Vertex AI responses using sample embeddings.
+* CI/CD pipeline in Cloud Build triggers automated regression scenarios.
+
+---
+
+**Q13. What are the main challenges you faced in building this MCP?**
+**A:**
+
+* Getting **prompt consistency** across asynchronous calls.
+* Managing **latency** in Vertex AI reasoning when chained.
+* Ensuring **memory coherency** (Firestore vs embeddings).
+* Designing **fine-grained rollback policies** for partial remediations.
+
+Each was mitigated by adding caching, async buffering, and rollback diffing.
+
+---
+
+### **5. “Tough-Round” Deep Dives**
+
+**Q14. How would this MCP design change if using CrewAI instead of GCP ADK?**
+**A:** CrewAI provides a similar concept with **CrewManager + Task** primitives. We’d replace ADK’s Orchestrator with **CrewManager**, Firestore with **CrewMemory**, and Pub/Sub with a queue (e.g., Redis).
+But the **semantic pattern remains identical** — Orchestrator → Detector → Remediator → Feedback → Governance, all mediated via event bus and memory store.
+
+---
+
+**Q15. Can you evolve this pattern toward an “Autonomous DataOps” future state?**
+**A:** Yes — next step is **predictive remediation**:
+
+* Agents generate DQ risk scores before jobs run.
+* LLM predicts likely anomalies using embeddings from prior incidents.
+* Low-risk issues auto-healed; high-risk flagged for approval.
+  This moves from **reactive data quality** → **proactive data reliability management**.
+
+---
+
+✅ **Quick Interview Summary (How to Conclude)**
+
+> “Our MCP pattern turns rule-based DQ gates into an intelligent, self-learning control plane.
+> It brings together ADK’s agent runtime, Pub/Sub orchestration, Vertex AI reasoning, and Dataplex governance.
+> The design is modular, observable, and policy-aware — built for scale and explainability.”
+
+---
+
+Would you like me to now generate a **diagram** (MCP + A2A topology, showing event flow and memory) for this Doc-5 to accompany your whiteboard walkthrough?
+
 
