@@ -573,5 +573,462 @@ Each agent uses a **Retrieval-Augmented Generation (RAG)** mechanism:
 > Fine-tuning comes later — once we’ve built enough validated prompt-response data to justify stable, domain-specific behavior.”
 
 ---
+# **Doc-3A: Prompt Registry Architecture & Dynamic Prompt Injection in Agentic AI Systems (GCP ADK-based)**
 
+*(Follow-up to Doc-3: Prompt Engineering & Fine-Tuning – Practical Guide)*
+
+---
+
+## **1. Purpose & Context**
+
+This document provides an implementation blueprint for designing and integrating a **Prompt Registry** within a **multi-agent (Agentic AI) data quality platform** on Google Cloud.
+
+The goal is to:
+
+* Enable dynamic retrieval and injection of prompt templates at runtime,
+* Version and govern prompts (as assets) like code artifacts,
+* Avoid unnecessary fine-tuning while improving consistency, reusability, and governance,
+* Empower the Feedback Agent to continuously refine and store improved prompts post Human-In-The-Loop (HITL) feedback.
+
+This approach ensures the system stays explainable, compliant, and adaptive without retraining models frequently.
+
+---
+
+## **2. Problem Framing**
+
+Traditional LLM pipelines rely on:
+
+* **Static prompt templates** (hardcoded, brittle, untracked)
+* Or **fine-tuned models** (costly, rigid, hard to govern)
+
+For enterprise DQ systems, both fail because:
+
+1. DQ rules evolve (e.g., “allowed missing rate” may change).
+2. Human stewards give qualitative feedback that must update system behavior dynamically.
+3. Governance requires auditable versions of prompts that led to a specific decision.
+
+Hence, a **Prompt Registry** becomes the single source of truth — analogous to **feature stores** in ML pipelines.
+
+---
+
+## **3. Architecture Overview**
+
+### **High-level Flow**
+
+1. **Agent Invocation**
+
+   * An agent (e.g., Detector or Explainer) receives a task (JSON).
+   * The Orchestrator Agent determines task type and priority.
+
+2. **Prompt Retrieval**
+
+   * Agent queries the **Prompt Registry** (via REST API or Firestore lookup).
+   * Matching logic is based on: `agent_type`, `task_type`, `dataset_domain`, and optionally `DQ_rule_category`.
+
+3. **Prompt Composition**
+
+   * Retrieved prompt template is dynamically parameterized with context:
+
+     * `{{dataset_name}}`, `{{incident_summary}}`, `{{rule_name}}`, `{{confidence}}`, etc.
+   * The agent builds the **final system + user prompt** for the Vertex AI LLM call.
+
+4. **Execution**
+
+   * The prompt is sent to Vertex AI (Gemini or Text-Bison) via `vertexai.generative_models`.
+   * Output and metadata are captured.
+
+5. **Feedback & Evolution**
+
+   * Feedback Agent logs effectiveness → updates prompt version or weights ranking in registry.
+   * Steward or governance workflow reviews changes before promotion.
+
+---
+
+## **4. Key Components**
+
+| Component                   | Purpose                                                                    | Implementation                                            |
+| --------------------------- | -------------------------------------------------------------------------- | --------------------------------------------------------- |
+| **Prompt Registry**         | Central store for all prompt templates, versions, and metadata.            | Firestore collection `prompt_registry` or BigQuery table. |
+| **Prompt Manager Module**   | Fetches, ranks, and parameterizes prompts.                                 | Custom Python class used by all agents.                   |
+| **Feedback Agent**          | Updates registry entries post-HITL review.                                 | Uses Firestore + Pub/Sub trigger.                         |
+| **Prompt Context Composer** | Merges retrieved prompt with runtime metadata, embeddings, and RAG output. | Built into ADK agent runtime.                             |
+| **Governance Agent**        | Controls approval of modified prompts before production.                   | Dataplex policy integration.                              |
+
+---
+
+## **5. Example Prompt Registry Schema (Firestore)**
+
+```json
+{
+  "prompt_id": "dq_detector_null_rate_v3",
+  "agent_type": "detector",
+  "task_type": "null_rate_check",
+  "dataset_domain": "billing",
+  "version": 3,
+  "prompt_text": "Analyze dataset {{dataset_name}} for null anomalies in {{column_name}}. Use rule thresholds from {{policy_source}} and explain deviations in plain English.",
+  "embedding_vector": [0.12, -0.43, ...],
+  "created_by": "data_governance_agent",
+  "created_on": "2025-09-10T12:00:00Z",
+  "status": "approved",
+  "usage_count": 215,
+  "avg_feedback_score": 0.91
+}
+```
+
+---
+
+## **6. Python Implementation (GCP ADK + Vertex AI + Firestore)**
+
+### **6.1 Prompt Manager Class**
+
+```python
+from google.cloud import firestore
+from vertexai.generative_models import GenerativeModel
+
+class PromptManager:
+    def __init__(self, project_id, collection="prompt_registry"):
+        self.db = firestore.Client(project=project_id)
+        self.collection = collection
+
+    def get_prompt(self, agent_type, task_type, dataset_domain):
+        query = (
+            self.db.collection(self.collection)
+            .where("agent_type", "==", agent_type)
+            .where("task_type", "==", task_type)
+            .where("dataset_domain", "==", dataset_domain)
+            .where("status", "==", "approved")
+        )
+        docs = list(query.stream())
+        if not docs:
+            raise ValueError("No prompt found for given criteria.")
+        # Choose best-rated prompt
+        best_prompt = max(docs, key=lambda d: d.to_dict()["avg_feedback_score"])
+        return best_prompt.to_dict()
+
+    def render_prompt(self, prompt_text, context_vars):
+        return prompt_text.format(**context_vars)
+
+class AgentPromptExecutor:
+    def __init__(self, model_name="gemini-1.5-pro"):
+        self.model = GenerativeModel(model_name)
+
+    def execute(self, final_prompt):
+        response = self.model.generate_content(final_prompt)
+        return response.text
+```
+
+---
+
+### **6.2 Agent Runtime Usage Example**
+
+```python
+# Detector Agent workflow
+pm = PromptManager(project_id="my-gcp-project")
+prompt_entry = pm.get_prompt("detector", "null_rate_check", "billing")
+
+context = {
+    "dataset_name": "billing.prod_charges",
+    "column_name": "amount",
+    "policy_source": "dataplex_rules_v2"
+}
+
+final_prompt = pm.render_prompt(prompt_entry["prompt_text"], context)
+
+executor = AgentPromptExecutor()
+result = executor.execute(final_prompt)
+print(result)
+```
+
+---
+
+## **7. Integration with ADK + AgentSpace**
+
+In **Google Cloud ADK (Agent Development Kit)**:
+
+* Each agent has a **“prompt_adapter()”** method.
+* You can override this to fetch and render prompt templates dynamically using the `PromptManager`.
+
+Example ADK Integration:
+
+```python
+from google.cloud import adk
+
+class DetectorAgent(adk.Agent):
+    def prompt_adapter(self, task_payload):
+        prompt_entry = pm.get_prompt("detector", task_payload["task_type"], task_payload["domain"])
+        rendered = pm.render_prompt(prompt_entry["prompt_text"], task_payload)
+        return rendered
+```
+
+Agents in **AgentSpace** then inherit this behavior.
+Thus, **prompt retrieval becomes a native step in A2A orchestration**.
+
+---
+
+## **8. Optional Performance Enhancements**
+
+| Use Case                        | Tool / Pattern                                   | Purpose                                     |
+| ------------------------------- | ------------------------------------------------ | ------------------------------------------- |
+| Caching frequent prompt lookups | **Redis / Memorystore**                          | Reduce Firestore latency                    |
+| Similar prompt retrieval        | **Vertex Matching Engine / BigQuery embeddings** | Nearest-neighbor search for similar prompts |
+| Governance & version control    | **Dataplex metadata tags**                       | Track prompt lineage                        |
+| Feedback ranking                | **Pub/Sub + Cloud Functions**                    | Auto-update prompt popularity score         |
+
+---
+
+## **9. Example Governance Policy Flow**
+
+1. Feedback Agent posts updated prompt to Firestore with `status="proposed"`.
+2. Governance Agent triggers Cloud Function that creates a Dataplex policy review ticket.
+3. After human approval, status → `approved`.
+4. Orchestrator Agent starts using new version automatically (via timestamp query).
+
+---
+
+## **10. Benefits**
+
+| Benefit       | Description                                                    |
+| ------------- | -------------------------------------------------------------- |
+| **Adaptive**  | Agents evolve prompt intelligence without fine-tuning costs.   |
+| **Auditable** | Every LLM response can be traced to a specific prompt version. |
+| **Reusable**  | Prompts reused across agents and domains with minimal rework.  |
+| **Governed**  | Central control for approvals and lineage.                     |
+| **Efficient** | Reduces API token usage and improves consistency.              |
+
+---
+
+## **11. Interview & Whiteboard Prompts**
+
+| Question                                                                 | Example Answer                                                                                                                 |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| **Q1. Why maintain a prompt registry instead of static YAML templates?** | Because prompts evolve faster than models; storing and versioning them allows agility and governance.                          |
+| **Q2. How does your system pick the right prompt?**                      | Based on agent type, task type, and dataset domain; scored by feedback and stored in Firestore.                                |
+| **Q3. How is feedback incorporated?**                                    | Steward or user feedback triggers an update in prompt version and score, which influences prompt selection next time.          |
+| **Q4. Can it replace fine-tuning?**                                      | For many structured reasoning or rule discovery tasks, yes — dynamic prompt injection achieves 80–90% of fine-tuning benefits. |
+| **Q5. How do you prevent unapproved prompt usage?**                      | Governance Agent only serves prompts with `status="approved"`; all others are filtered out in query logic.                     |
+| **Q6. How is latency managed?**                                          | Using Redis cache or embedding-based nearest-neighbor retrieval instead of direct Firestore queries.                           |
+
+---
+
+## **12. References**
+
+* Google Cloud Vertex AI Agent Builder: [https://cloud.google.com/vertex-ai/docs/agents](https://cloud.google.com/vertex-ai/docs/agents)
+* GCP Agent Development Kit (ADK)
+* GCP Dataplex Metadata APIs
+* Firestore as dynamic metadata store
+
+
+# 🧩 Doc-3B: Prompt Registry Architecture & Portability
+
+### *Bridging Prompt Intelligence Across GCP ADK and CrewAI*
+
+---
+
+## 1. Executive Summary
+
+Traditional fine-tuning is costly, slow, and brittle in enterprise data ecosystems where data quality (DQ) checks evolve dynamically.
+A **Prompt Registry** solves this by acting as a *live prompt memory*, enabling the **agents** to:
+
+* Fetch the **best prompt versions** dynamically at runtime,
+* Learn from **feedback agent** signals (approved, rejected, modified),
+* Adapt to **new data domains** without re-training,
+* Maintain **traceability and governance** across evolving GenAI use cases.
+
+In our **GCP-centric Agentic AI DQ system**, the Prompt Registry is implemented using **Firestore + Vertex AI Prompt Manager + Dataplex Catalog tags**, with optional **Redis caching** for CrewAI portability.
+
+---
+
+## 2. Architectural Positioning
+
+### 🔹 Integration into Doc-2 / Doc-3 Architecture
+
+| Component                       | Role in Prompt Flow                                 | Key Tools                           |
+| ------------------------------- | --------------------------------------------------- | ----------------------------------- |
+| **Orchestrator Agent**          | Retrieves task context, selects base prompt ID      | ADK Orchestrator Runtime, Firestore |
+| **Prompt Registry**             | Stores, versions, and retrieves prompts             | Firestore, Vertex AI Prompt Manager |
+| **Detector / Explainer Agents** | Pull latest approved prompt variants                | ADK AgentTool API, Redis Cache      |
+| **Feedback Agent**              | Logs steward feedback → triggers prompt revision    | Pub/Sub, Cloud Functions            |
+| **Governance Agent**            | Validates approved prompts, stores metadata lineage | Dataplex Catalog, IAM Policies      |
+| **CrewAI Runtime (optional)**   | Uses prompt registry via CrewTool API               | CrewAI MemoryStore, Redis, YAML     |
+
+---
+
+## 3. Prompt Registry Design
+
+### 🔸 Schema (Firestore)
+
+```json
+{
+  "prompt_id": "dq_explainer_v3",
+  "type": "explainer",
+  "context_scope": ["billing", "claims"],
+  "template": "You are a Data Quality assistant. Explain the cause for {{incident_type}} in {{dataset_name}} ...",
+  "version": 3,
+  "embedding_vector": [0.11, -0.09, 0.33, ...],
+  "metadata": {
+    "created_by": "feedback_agent",
+    "created_on": "2025-09-25",
+    "usage_count": 42,
+    "last_approved": "2025-10-10"
+  },
+  "status": "active"
+}
+```
+
+---
+
+### 🔸 Dataflow
+
+```
+[Incident Event] → Orchestrator Agent 
+   → Fetches context (dataset, domain, type)
+   → Queries Prompt Registry (Firestore/Redis)
+   → Returns best-fit prompt template
+   → Detector/Explainer Agents instantiate prompt 
+   → Vertex AI (Gemini) executes reasoning
+   → Result stored → Feedback loop updates registry
+```
+
+---
+
+### 🔸 Retrieval Logic (ADK Example)
+
+```python
+from google.cloud import firestore
+from vertexai.preview.prompts import PromptManager
+
+def fetch_prompt(context_scope, agent_type):
+    db = firestore.Client()
+    registry_ref = db.collection("prompt_registry")
+    query = registry_ref.where("context_scope", "array_contains_any", context_scope)\
+                        .where("type", "==", agent_type)\
+                        .where("status", "==", "active")
+    results = query.stream()
+    selected_prompt = max(results, key=lambda p: p.to_dict().get("version"))
+    return selected_prompt.to_dict()
+```
+
+---
+
+## 4. CrewAI Portability Addendum
+
+In CrewAI, prompt retrieval can be offloaded to a **CrewTool** using Redis or YAML storage.
+
+### Example (CrewTool YAML Config)
+
+```yaml
+prompt_registry:
+  dq_explainer_v3:
+    type: explainer
+    context_scope: ["claims"]
+    template: >
+      You are a GenAI DQ analyst. Explain the missing value issue in {{dataset}}.
+    version: 3
+    metadata:
+      owner: feedback_agent
+      last_approved: "2025-10-10"
+```
+
+### Redis-backed Registry Accessor
+
+```python
+import redis, json
+
+r = redis.Redis(host='redis-service', port=6379, db=0)
+
+def get_prompt_from_registry(agent_type, context):
+    key = f"{agent_type}:{context}"
+    if (prompt := r.get(key)):
+        return json.loads(prompt)
+    # fallback to Firestore if not cached
+    return fetch_prompt(context, agent_type)
+```
+
+---
+
+## 5. Prompt Lifecycle Management
+
+| Stage                | Trigger                         | Description                          | Tool                     |
+| -------------------- | ------------------------------- | ------------------------------------ | ------------------------ |
+| **Creation**         | Agent dev / steward adds prompt | Insert into Firestore / YAML         | Vertex Prompt Manager    |
+| **Retrieval**        | Agent execution                 | Query context match + latest version | ADK Orchestrator / Redis |
+| **Execution**        | Vertex AI Gemini inference      | Insert prompt + data context         | Vertex AI SDK            |
+| **Feedback**         | Steward approval/rejection      | Feedback Agent update                | Pub/Sub → Firestore      |
+| **Embedding Update** | Approved prompt → vector index  | Semantic search ready                | Vertex Matching Engine   |
+| **Archival**         | Deprecated versions             | Mark inactive + audit tag            | Dataplex Catalog lineage |
+
+---
+
+## 6. Memory and Contextual Injection
+
+Prompt selection integrates with the **agent memory layer**:
+
+* Firestore → LTM (long-term)
+* Redis → STM (short-term)
+* Vertex Matching Engine → semantic recall (similarity search)
+
+```python
+def contextualize_prompt(base_prompt, incident):
+    memory_snippets = query_vector_memory(incident["type"])
+    filled_prompt = base_prompt["template"].replace("{{incident_type}}", incident["type"])
+    return filled_prompt + "\n\nContext:\n" + "\n".join(memory_snippets)
+```
+
+---
+
+## 7. Example End-to-End Prompt Flow
+
+### Scenario
+
+An ingestion event triggers a DQ check on `billing.prod_charges` with missing invoice IDs.
+
+1. **Orchestrator Agent**: detects "billing" → fetches prompt ID `dq_explainer_v3`
+2. **Prompt Template**:
+
+   ```
+   You are a Data Quality assistant. Explain why {{incident_type}} might occur in {{dataset_name}}.
+   ```
+3. **Contextual Injection**:
+
+   ```
+   Incident type: missing invoice_id  
+   Dataset: billing.prod_charges  
+   Context: schema has nullable invoice_id, data entry from ETL job BDM12  
+   ```
+4. **Vertex AI Response**:
+   → Suggests cause as upstream job mapping error; recommends check on `etl_map_invoice`.
+5. **Feedback Agent**: steward approves → usage_count++, feedback stored.
+6. **Embedding Update**: new embedding vector stored in Matching Engine.
+
+---
+
+## 8. Interview-Ready Talking Points
+
+| Topic                                         | Example Question                                                                                                         | Strong Answer Summary |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | --------------------- |
+| **Why Prompt Registry over Fine-Tuning?**     | Fine-tuning fixes model weights; registry enables dynamic domain adaptation and human oversight without retraining cost. |                       |
+| **How is version control handled?**           | Firestore doc versioning; metadata tags in Dataplex Catalog maintain lineage across approved prompts.                    |                       |
+| **How do agents fetch prompts contextually?** | Agents call the registry API filtered by domain, type, and policy tags; fallback to semantic search in Matching Engine.  |                       |
+| **What’s CrewAI’s advantage?**                | Lightweight YAML/Redis prompt portability; faster agent startup and fewer GCP dependencies in hybrid deployments.        |                       |
+| **How to govern prompt usage?**               | IAM + Dataplex tags + Cloud DLP ensure only validated prompts are executable in production.                              |                       |
+
+---
+
+## 9. Future Enhancements
+
+* **LLM-assisted Prompt Scoring**: Gemini models can evaluate prompt quality based on historical success rate.
+* **Dynamic Prompt Routing**: Use reward models to select the most effective prompt at runtime.
+* **Auto-documentation**: Generate audit entries from registry updates into Confluence or BigQuery.
+* **Cross-platform Portability**: Unified abstraction layer supporting both ADK and CrewAI prompt stores.
+
+---
+
+## 10. Quick Recap for Interviews
+
+> “We replaced static prompt hardcoding with a dynamic Prompt Registry that agents query contextually.
+> It’s backed by Firestore and integrated with Vertex AI Prompt Manager for version control.
+> The Feedback Agent updates it based on human approvals, while Matching Engine provides semantic recall.
+> For portability, CrewAI agents use Redis/YAML-based prompt cache — making the design reusable across GCP and hybrid clouds.”
+
+---
 
