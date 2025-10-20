@@ -302,5 +302,276 @@ Each agent reuses the prior agent’s output as context — forming a **prompt c
  └──────────────────────────────────┘
 ```
 
+# **Doc-3 Addendum: Likely Interview Questions & Whiteboard Prompts on Prompt Engineering & Fine-Tuning**
+
 ---
+
+## **1. Section A — Prompt Engineering Fundamentals**
+
+### **Q1. What is Prompt Engineering, and why is it critical in an Agentic AI DQ system?**
+
+**Answer:**
+Prompt Engineering is the practice of designing structured, context-aware instructions that guide a large language model (LLM) toward reliable, predictable, and auditable outputs.
+In the Agentic DQ system:
+
+* Each agent (Detector, Remediator, Governance, Feedback) acts as a specialized role with its own **prompt contract**.
+* Prompts inject **schema, metadata, and historical DQ context** to anchor the model’s reasoning.
+* Structured JSON outputs ensure **machine-readable** interoperability between agents.
+  Without disciplined prompt design, responses would drift, become verbose, or violate schema boundaries.
+
+> **Whiteboard Cue:** Draw the “Prompt Layer Stack” (System → Instruction → Context → Output Guard) and show how Dataplex metadata feeds into the Context layer.
+
+---
+
+### **Q2. Explain the difference between system prompts, instruction prompts, and contextual prompts.**
+
+| Layer                   | Description                                       | Example                                                        |
+| ----------------------- | ------------------------------------------------- | -------------------------------------------------------------- |
+| **System Prompt**       | Defines the agent’s role and tone.                | “You are a Data Quality Detector for financial data.”          |
+| **Instruction Prompt**  | Specific task description.                        | “Identify columns with semantic inconsistencies.”              |
+| **Context Prompt**      | Injects dynamic runtime info (schema, anomalies). | “Schema: customer_id INT, purchase_dt DATE…”                   |
+| **Output Guard Prompt** | Defines format, structure, and boundaries.        | “Respond only in JSON with fields: column, issue, confidence.” |
+
+> **Tip:** Emphasize how modular layering makes it easier to A/B test prompt variants without retraining models.
+
+---
+
+### **Q3. How do you handle prompt drift when schemas or data types change frequently?**
+
+**Answer:**
+
+1. Maintain **parameterized templates** — e.g., `{schema}`, `{sample_rows}`, `{dq_rules}`.
+2. Dynamically build context via Dataplex API and Firestore before prompt dispatch.
+3. Implement **prompt evaluation checks** (token length, missing placeholders).
+4. Version prompts in **ADK PromptRegistry** and use rollback if performance degrades.
+
+> **Whiteboard Cue:** Show schema change detection → trigger prompt rebuild workflow via Cloud Function.
+
+---
+
+## **2. Section B — Designing Robust Prompts**
+
+### **Q4. What patterns are used in the Detector and Remediator agents’ prompts?**
+
+**Answer:**
+
+* **Detector Pattern:** Hybrid reasoning (SQL + contextual LLM) — uses *structured observation* template.
+* **Remediator Pattern:** *Tool-augmented reasoning* — model outputs SQL → validated via dry-run (MCP Tool).
+* **Feedback Pattern:** *Reflection prompting* — converts steward comments into structured learning events.
+* **Governance Pattern:** *Policy reasoning* — ensures rule compliance via Dataplex metadata grounding.
+
+| Pattern                    | Example                                                                |
+| -------------------------- | ---------------------------------------------------------------------- |
+| **Chain-of-Thought (CoT)** | “Explain your reasoning before producing JSON output.”                 |
+| **RAG Grounding**          | “Use Dataplex schema & historical DQ incidents as reference.”          |
+| **JSON Guardrail**         | “Output must follow format: [{column, issue, confidence, suggestion}]” |
+| **Multi-turn Correction**  | “If SQL validation fails, re-evaluate with error context.”             |
+
+---
+
+### **Q5. How do you test and evaluate prompt quality?**
+
+**Answer:**
+Use both **quantitative** and **qualitative** metrics:
+
+| Metric                          | Purpose                                       | Tool                      |
+| ------------------------------- | --------------------------------------------- | ------------------------- |
+| **JSON Validity Rate**          | Ensures structured format compliance.         | Python JSON parser tests  |
+| **Semantic Accuracy**           | Measures match with human-labeled truth.      | Vertex Eval SDK           |
+| **SQL Executability**           | % of generated queries that run successfully. | BigQuery dry-run API      |
+| **Consistency Across Versions** | Detects drift.                                | PromptRegistry diff tests |
+
+> **Whiteboard Cue:** Draw evaluation pipeline — Prompt Variant A/B → Validation Tests → Score Logging → Registry Update.
+
+---
+
+### **Q6. Give an example of a poorly designed prompt and its fix.**
+
+| Poor Prompt                       | Issue                                  | Fix                                              |
+| --------------------------------- | -------------------------------------- | ------------------------------------------------ |
+| “Check for errors in dataset.”    | Too vague; no role or format guidance. | Add role, schema context, and output constraint. |
+| “Find anomalies using AI.”        | No grounding; leads to hallucination.  | Inject Dataplex schema + rule context.           |
+| “Suggest fixes for missing data.” | Lacks validation guardrail.            | Add “generate SQL + dry-run diff required.”      |
+
+---
+
+## **3. Section C — Fine-Tuning Strategy**
+
+### **Q7. When do you decide to fine-tune instead of improving prompts?**
+
+**Answer:**
+Fine-tuning is needed when:
+
+* Responses must be **consistent across many schemas/domains**.
+* Prompt tokens become too long or repetitive.
+* You need **behavioral specialization** (e.g., risk classification).
+
+> **Rule of Thumb:**
+> Use **prompt tuning** for *control* and **fine-tuning** for *stability*.
+
+---
+
+### **Q8. Describe the fine-tuning workflow on Vertex AI for this project.**
+
+**Answer:**
+
+1. Collect validated prompt-response pairs (approved steward cases).
+2. Store them in **BigQuery LTM dataset**.
+3. Export to **Cloud Storage → Vertex Fine-Tuning job**.
+4. Evaluate new checkpoint with Vertex Evaluation SDK.
+5. Register fine-tuned model version in **ADK Model Registry**.
+6. Update inference endpoint in the Orchestrator Agent.
+
+| Step      | Tool       | Output           |
+| --------- | ---------- | ---------------- |
+| Data Prep | BigQuery   | Training JSONL   |
+| Training  | Vertex AI  | Fine-tuned model |
+| Eval      | Vertex SDK | BLEU + accuracy  |
+| Deploy    | Cloud Run  | API endpoint     |
+
+---
+
+### **Q9. What are the trade-offs of fine-tuning versus using retrieval-augmented prompts (RAG)?**
+
+| Aspect           | Fine-Tuning                            | RAG                                 |
+| ---------------- | -------------------------------------- | ----------------------------------- |
+| **Cost**         | High upfront                           | Lower (no retraining)               |
+| **Adaptability** | Slower to adapt                        | Instantly updated with embeddings   |
+| **Consistency**  | Very stable                            | Depends on embedding relevance      |
+| **Best For**     | Policy classification, rule suggestion | Schema reasoning, anomaly detection |
+
+> **Whiteboard Cue:** Draw “Prompt vs Fine-Tuning Boundary” — what’s solved by context vs what’s baked into weights.
+
+---
+
+## **4. Section D — Integration & Memory**
+
+### **Q10. How do prompts leverage memory or embeddings in this system?**
+
+**Answer:**
+Each agent uses a **Retrieval-Augmented Generation (RAG)** mechanism:
+
+1. Query **Vertex Matching Engine** for embeddings related to the dataset or prior incident.
+2. Inject retrieved snippets into the context prompt.
+3. Model uses the combined context + instruction for reasoning.
+4. Output stored in Firestore and appended to LTM.
+
+> **Whiteboard Cue:**
+> “Incident → Embedding → RAG Fetch → Prompt Assembly → Response → LTM Update” loop.
+
+---
+
+### **Q11. How do you ensure prompt safety and governance compliance?**
+
+**Answer:**
+
+* Enforce **PII redaction** via Cloud DLP API before prompt dispatch.
+* Maintain **prompt version lineage** in Firestore (who changed what, when).
+* Use **approval thresholds** in Governance Agent: high-risk prompts require dual sign-off.
+* Evaluate **LLM toxicity and leakage** risk via Vertex Safety Filters.
+
+---
+
+## **5. Section E — Applied Whiteboard Prompts**
+
+### **Prompt 1 — Detector Reasoning**
+
+> “Show how you would design a prompt for detecting null-rate anomalies in customer transactions using Dataplex metadata.”
+
+**Expected Whiteboard Answer:**
+
+1. System Role → “You are a Data Quality Detector.”
+2. Context → Inject schema & prior thresholds.
+3. Task → “Identify columns violating null-rate > threshold.”
+4. Format → JSON output.
+5. Grounding → Link Dataplex tags (customer_id, region).
+6. Example Output → show structured JSON with column, issue, confidence.
+
+---
+
+### **Prompt 2 — Remediation Flow**
+
+> “Design a prompt for an agent that fixes duplicate records automatically but validates against risk policy.”
+
+**Expected Steps:**
+
+1. Ingest dq_incident JSON.
+2. Propose SQL remediation + rollback script.
+3. Assign risk score = HIGH if primary key involved.
+4. Require manual approval path if `risk >= 0.6`.
+5. Output structured JSON: `{sql_patch, rollback, risk}`.
+
+---
+
+### **Prompt 3 — Feedback Loop**
+
+> “How do you incorporate human feedback into the learning loop?”
+
+**Answer:**
+
+* Feedback Agent captures steward decisions as structured JSON.
+* Map `accepted/rejected + reason` into **PromptRegistry** metadata.
+* When multiple rejections occur for a prompt version → auto-flag for refinement.
+* Store context in LTM for fine-tuning candidates.
+
+---
+
+## **6. Section F — Evaluation & Governance Questions**
+
+### **Q12. How do you track and audit prompt performance across agents?**
+
+**Answer:**
+
+* Every prompt call logs:
+
+  * Version ID
+  * Input context hash
+  * Token usage
+  * Output quality metrics
+* Firestore stores per-agent telemetry.
+* Dataplex metadata updates capture lineage of rule → incident → remediation → approval.
+
+---
+
+### **Q13. How do you ensure consistent JSON structure across multiple agents?**
+
+**Answer:**
+
+* Use **Prompt Templates with explicit JSON schema** validation before submission.
+* Each agent has a **JSON schema validator** class (ADK built-in).
+* Failed validations trigger fallback → safe “explanation-only” mode.
+
+---
+
+### **Q14. What’s your approach to prompt lifecycle management?**
+
+| Stage       | Activity                    | Tool            |
+| ----------- | --------------------------- | --------------- |
+| **Design**  | Draft template              | PromptRegistry  |
+| **Test**    | Evaluate against gold set   | Vertex Eval SDK |
+| **Deploy**  | Attach version tag          | Firestore       |
+| **Monitor** | Track drift / errors        | Cloud Logging   |
+| **Retire**  | Archive deprecated versions | GCS             |
+
+---
+
+## **7. Section G — “Explain Like You’re Whiteboarding” Flow**
+
+> “Imagine you’re whiteboarding this for an interviewer — walk through step by step.”
+
+1. **Draw the flow:** Dataplex metadata → RAG store → Detector prompt → dq_incident JSON → Remediator prompt → fix → Feedback prompt → Governance validation.
+2. **Explain roles:** “Each box represents an agent with its own system prompt, tuned for a narrow reasoning scope.”
+3. **Show feedback cycle:** “All accepted remediations feed back into fine-tuning corpus.”
+4. **Summarize:** “This converts a static DQ gate into a self-learning agentic ecosystem with explainable prompts, safe execution, and governance alignment.”
+
+---
+
+## **8. Section H — Interview Wrap-Up Summary**
+
+> “In short — prompt engineering here isn’t just about crafting clever instructions.
+> It’s a **design discipline** involving context injection, policy compliance, structured output, and measurable improvement.
+> Fine-tuning comes later — once we’ve built enough validated prompt-response data to justify stable, domain-specific behavior.”
+
+---
+
 
