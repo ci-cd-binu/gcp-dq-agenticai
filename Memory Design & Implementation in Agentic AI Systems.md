@@ -499,6 +499,395 @@ past_context = MemoryService.query("null value anomalies in billing dataset", to
 * **What is your memory scaling pattern?**
   → Active memories (last 30 days) in Firestore; archived in BigQuery for analytics; vector embeddings stored in Matching Engine for retrieval.
 
+
+
+# PART A — Fundamental technical checks (core concepts & validation)
+
+**Q1.** Describe exactly how you represented memory items (what fields, what metadata) in your vector DB for production. Show an example record.
+
+**Best answer:**
+“We stored memory items as JSON documents with these fields:
+
+```json
+{
+  "id": "mem_20240412_ORD12345",
+  "tenant_id": "OEM_A",
+  "agent": "order_analyst",
+  "type": "event_summary",            // event, preference, doc_chunk, metric_alert
+  "text": "Customer requested spec change from A to B on 2024-04-10. Reason: delay.",
+  "embedding_id": "emb_0001",
+  "embedding_dims": 1536,
+  "created_at": "2024-04-12T09:15:00Z",
+  "source": "orders_db/orders_v2",    // canonical source reference
+  "version": 3,
+  "confidence": 0.92,
+  "expires_at": "2024-07-12T09:15:00Z", // TTL for ephemeral memories
+  "tags": {"policy":"high_priority","region":"west_midlands"}
+}
+```
+
+We used `embedding_id` to map to the binary vector in FAISS/Pinecone. Important: we kept structured key/value metadata to enable precise filtering (tenant, agent, source, version) instead of relying purely on semantic similarity.”
+
 ---
+
+**Q2.** How did you decide embedding dimension, model, and update cadence? Give numbers and rationale.
+
+**Best answer:**
+“We benchmarked embeddings on three axes: retrieval Precision@5, index size (GB), and inference latency. We tested OpenAI embeddings (1536-d), a 1,024-d Mistral embedder, and an in-house 768-d model. For our scale (100k new chunks/day), 1536-d gave best precision but index costs and memory were high. We selected 1,024-d for production (negligible Precision@5 drop ~1.8%) to save 30% RAM. Update cadence: for transactional data (orders) we wrote embeddings at event time (near-real-time), but ran a nightly consolidation job for older entries to re-embed using latest model if `version < latest_version`. For doc stores we ran weekly full re-embedding if retrain events or model upgrade occurred.”
+
+---
+
+**Q3.** How did you avoid memory poisoning / injection attacks from user inputs?
+
+**Best answer:**
+“We employed a three-stage sanitization pipeline: preprocess → redact → validate. Preprocess applied regex filters for suspicious tokens (e.g., `<script>`, SQL-like strings). Redact replaced PII using name/email/phone detectors (regex + ML PII model). Validate ran a model-based content classifier (Bedrock moderation API) — if flagged as high-risk, we store only metadata (event marker) not the raw text. We also applied rate-limiting and token truncation to prevent huge payloads being stored. All writes required signed service-to-service JWTs with least privilege.”
+
+---
+
+**Q4.** Explain your memory consolidation algorithm — how did you merge duplicates and keep memory size bounded?
+
+**Best answer:**
+“We ran a 3-step consolidation: dedupe → summarize → index-compact. Concretely:
+
+1. **Dedupe:** nightly batch clusters new embeddings using HDBSCAN with cosine threshold ~0.88. Items in a cluster were candidates for consolidation.
+2. **Summarize:** For clusters older than 24hrs, we generated a 1–3 sentence canonical summary using a small instruction-tuned LLM and computed a new summary embedding. The original raw texts were archived to cold storage and their references kept in `source_archive`.
+3. **Index-compact:** replaced cluster member vectors with the single summary vector and incremented `version`. We kept cluster-level metadata like `member_count`, `first_seen`, `last_seen`. This reduced index size by ~60% in the telecom DQ project. We kept a compaction policy: compress clusters with `member_count>5` OR `last_seen < 90 days`.”
+
+---
+
+# PART B — Multi-Agent Vehicle Order Optimization (project-specific deep probes)
+
+**Q5.** How did you implement namespace isolation across agents to avoid collisions? Give code/config snippet or architecture sketch.
+
+**Best answer:**
+“We implemented namespace isolation in three layers: storage layer, retrieval layer, and access controls. Storage: vector table had a composite primary key `(tenant_id, agent_name, memory_id)` and we physically partitioned indices by `agent_name` (separate FAISS indexes per agent). Retrieval: retriever took `agent_name` as a hard filter before similarity query — in Pinecone we used `metadata_filter={"agent":"order_analyst","tenant":"OEM_A"}`. Access control: token scoping enforced via IAM policies — the Order Analyst service token could only list/read `order_analyst/*` keys. Example pseudo-config:
+
+```yaml
+retriever:
+  index: faiss_order_analyst
+  filter:
+    - key: agent
+      value: order_analyst
+```
+
+This prevented unintentional cross-agent reads unless explicitly orchestrated by a coordinator who held multi-agent privileges.”
+
+---
+
+**Q6.** Describe a real bug you saw due to memory drift and how you diagnosed & fixed it.
+
+**Best answer:**
+“Problem: The Customer Advisor repeatedly recommended an obsolete model line for customers; root cause was stale embeddings referencing discontinued specs. Diagnosis: we noticed a spike in hallucination metrics and sample checks showed embeddings with `created_at` from 2019 but `last_seen` not updated. Using audit logs we found a failed reindexing job (OOM) that had been silently retried and aborted. Fix: added job-level alerts, re-ran compaction with pagination (batch size 2,000), added an LRU cache invalidation when `product_catalog.version` increments. We also added a temporal decay factor in retrieval rank: `score = sim - alpha * age_days` so old memories naturally de-prioritize.”
+
+---
+
+**Q7.** How did you measure the benefit of caching short-term memory in Redis vs always hitting the vector DB?
+
+**Best answer:**
+“We A/B tested two fleets: A always queried FAISS; B used Redis-LRU cache for session-bound memories. Metrics measured: avg end-to-end latency, token usage (LLM calls), and cost per 1k queries. Results: Redis reduced average retrieval latency from 320ms → 42ms for cache hits, and reduced FAISS QPS by 48%, lowering infra cost ~21% and lowering per-request tokens due to fewer retrievals (fewer context inserts). For ephemeral session-only memories we cached in Redis with 30-min TTL and only persisted to FAISS if `persistence_flag` was set.”
+
+---
+
+**Q8.** Give the SQL or query you used to detect duplicate memories before consolidation in BigQuery.
+
+**Best answer:**
+“We used a near-duplicate detection query based on embeddings’ cosine similarity stored as floats in BigQuery (via approximate nearest neighbor precompute). Example simplified SQL:
+
+```sql
+WITH recent AS (
+  SELECT id, embedding
+  FROM `project.dataset.memories`
+  WHERE created_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+)
+SELECT a.id AS id_a, b.id AS id_b,
+  1 - (SUM(a.elem*b.elem)/ (SQRT(SUM(a.elem*a.elem))*SQRT(SUM(b.elem*b.elem)))) AS cosine_distance
+FROM recent a
+JOIN recent b ON a.id < b.id
+GROUP BY id_a, id_b
+HAVING cosine_distance < 0.12
+```
+
+We limited this to candidate sets using MinHash prefiltering to avoid O(N²), and then used the true cosine threshold for final decision.”
+
+---
+
+# PART C — Agentic Data Quality Orchestration (project-specific)
+
+**Q9.** How did you store episodic alarms and link them to memory so an agent learns from past anomalies?
+
+**Best answer:**
+“Each anomaly was stored as an episodic memory with schema: `{anomaly_id, pipeline_id, metric_name, metric_value, root_cause_summary, remediation_action, resolved, resolved_at}`. We connected this to the agent by tagging related schema/table chunk embeddings with `pipeline_id` and `anomaly_id`. When similar metric drift occurred, retriever pulled last `k` anomaly memory items and we ran a 'lessons learned' summarizer to propose remediation. This feed was used to generate proposed code changes (SQL) or config updates which then entered a human approval flow.”
+
+---
+
+**Q10.** Share a production runbook you used when memory compaction job failed.
+
+**Best answer:**
+“Runbook (short):
+
+1. Check job logs in Cloud Logging for `OOM` or `500` errors.
+2. If OOM → reduce batch_size (e.g., from 10k → 2k) and re-run with `--resume_token`.
+3. If failure due to BadData → run validation (`jq`/custom script) on input chunk anchoring. Move offending records to quarantine bucket `gs://dq-quarantine/YYYYMMDD/`.
+4. After fix, re-trigger compaction in maintenance window; track progress with `compaction_job_{id}` events written to `compaction_audit` table.
+5. Notify stakeholders and block read-write until indexes are consistent (using a `maintenance_mode` flag).”
+
+---
+
+**Q11.** How did you ensure that summarized memories retained training signal necessary for retraining anomaly detectors?
+
+**Best answer:**
+“We preserved training signal by creating a `semantic_anchor` for each summary: a small vector of key numeric stats (mean, std, last_value, anomaly_score) and a pointer to archived raw data in cold storage. The summarizer also stored a `lossy_score` indicating information loss. When `lossy_score > 0.3`, we retained raw chunks (did not compress). During retraining we fetched raw archives only for clusters marked with `lossy_score > 0.3` to reconstruct features. This allowed us to keep index compact while preserving model retrain fidelity.”
+
+---
+
+# PART D — Agentic Architecture Office (project-specific)
+
+**Q12.** For the multi-index RAG you built (LangChain + Kendra + Bedrock), how did you fuse results and score-rank them? Provide the scoring formula.
+
+**Best answer:**
+“We used a hybrid fusion ranking: first we collected top-N from each index (Kendra, FAISS, internal KB). For each candidate doc `d` we computed:
+
+```
+score_d = w1 * norm_sim_faiss(d) + w2 * norm_kendra_score(d) + w3 * freshness_boost(d) + w4 * policy_match(d)
+```
+
+Normalized scores used min-max over top-N. We tuned weights (`w1=0.6, w2=0.25, w3=0.1, w4=0.05`) via grid search on a validation set of 500 architecture queries. Freshness boost penalized docs older than 365 days by -0.2. Policy match was a binary 0/1 where exact standard ID match added +0.15. This fusion reduced false positive matches on compliance checks by ~18%.”
+
+---
+
+**Q13.** How did you prevent untrusted ADRs from poisoning the knowledge base?
+
+**Best answer:**
+“We added a pre-ingest pipeline: submitter uploads ADR → automatic metadata extraction (author, service, tags) → Bedrock moderation + open-source heuristics to detect code snippets or secrets → a verification microtask assigned to a senior architect for manual approval. Only after approval did ingestion job add the doc to the RAG index with `trusted=true`. Untrusted docs were ingested into a quarantined `staging` index with `trusted=false` and omitted from compliance checks.”
+
+---
+
+# PART E — Enterprise GenAI Revenue Platform (multi-cloud)
+
+**Q14.** How was cross-cloud memory coherence achieved when you had per-cloud indexes?
+
+**Best answer:**
+“We created a Memory Orchestrator service that maintained a global metadata catalog in a central PostgreSQL (with per-tenant entries). Each memory write included `preferred_region` and `replication_policy`. For retrieval we first checked local edge cache; if miss, orchestrator issued parallel queries to cloud-native indexes (Pinecone on AWS, Vertex Index on GCP) with a `fan-in` timeout of 600ms. We merged results using the same fusion formula as earlier. Per-tenant KMS keys ensured encryption separation. This approach prioritized locality while allowing fallbacks for missing shards.”
+
+---
+
+**Q15.** Give an example of policy you applied for GDPR/retention across clouds and how enforcement was automated.
+
+**Best answer:**
+“Policy: Personal data embeddings retained max 90 days unless explicit consent. Implementation: each memory document had `sensitivity_level` and `consent_id`. A lifecycle service scanned indexes daily to find entries with `sensitivity_level>=PII` and `expires_at < now()` and invoked secure-delete APIs on each cloud index. We logged deletions in an immutable audit store (WORM) and provided controllers for data subject requests by reconstructing `consent_id` events. Automation used Cloud Functions + HashiCorp Vault to rotate deletion credentials.”
+
+---
+
+# PART F — RAG-Powered Insurance Policy Copilot (project-specific)
+
+**Q16.** You said you used dual-embedding strategy (clause-level + metadata). How did you implement hierarchical FAISS indexes? Show the index structure.
+
+**Best answer:**
+“Index structure: top-level FAISS had vectors for "document-level" summaries (`doc_index`), while a second FAISS index held "clause-level" vectors (`clause_index`). Retrieval pipeline: first query `doc_index` to fetch top-M doc candidates; then query `clause_index` restricted to those doc ids (metadata filter) to retrieve fine-grained clauses. Implementation: clause vectors stored with `doc_id` metadata; we used locality-sensitive hashing to prefilter clause set for the doc candidates. This allowed precise clause matches without scanning the whole clause index.”
+
+---
+
+**Q17.** How did you combine LightGBM predictions with RAG results when giving the final recommendation?
+
+**Best answer:**
+“We used a decision fusion layer: LightGBM produced a retention probability `p_retain`. RAG produced an evidence score `s_evd` (0–1). Final action decision used:
+
+```
+if p_retain > 0.75 and s_evd > 0.4:
+   suggest personalized renewal offer
+elif p_retain between 0.4–0.75:
+   escalate to agent with summarized evidence
+else:
+   mark for automated churn outreach
+```
+
+We trained an ensemble calibrator (small logistic regression) on historical labeled outcomes to convert raw `p_retain`+`s_evd` to calibrated decision thresholds. This approach increased true positive retention actions by 12% vs LGBM-only.”
+
+---
+
+# PART G — Cross-cutting operational & monitoring checks
+
+**Q18.** What are the exact observability signals you shipped for memory subsystem (list metrics and example thresholds)?
+
+**Best answer:**
+“Key metrics: `mem_write_qps`, `mem_read_qps`, `avg_retrieval_latency_ms`, `cache_hit_rate`, `index_size_gb`, `daily_compactions`, `ttl_evictions`, `embedding_failure_rate`, `hallucination_rate`. Example thresholds/alerts:
+
+* `avg_retrieval_latency_ms > 500ms` -> P2 alert
+* `cache_hit_rate < 60%` for >10min -> investigate cache miss patterns
+* `index_size_gb` growth >10% day-over-day -> trigger compaction plan
+* `embedding_failure_rate > 1%` -> block persistence & alert SRE.
+  We exported these via Prometheus + Grafana and integrated with Slack + PagerDuty.”
+
+---
+
+**Q19.** How did you measure and define hallucination rate operationally?
+
+**Best answer:**
+“We defined hallucination as model output asserting fact `F` where `F` is contradicted by any canonical source returned within top-10 retrieval candidates. Operationally: after each query we ran a verifier model that attempted to find supporting evidence for each asserted atomic claim; if support score < 0.2 we flagged it. We measured hallucination rate as `#flagged_responses / #total_responses` over a rolling 24h. For production, we kept `hallucination_rate < 0.8%`. This was validated with manual audits monthly.”
+
+---
+
+**Q20.** Give a concrete example of a log trace for a request that includes prompt→retrieval→model→tool. What fields are present?
+
+**Best answer:**
+“Example JSON trace snippet:
+
+```json
+{
+ "request_id":"req-20250421-0001",
+ "user":"tenantA_user123",
+ "timestamp":"2025-04-21T10:12:03Z",
+ "prompt":"Summarize customer order ORD12345",
+ "retrieval": [
+   {"source":"faiss_order_analyst","doc_id":"doc-987","sim":0.86},
+   {"source":"orders_db","doc_id":"ord-12345","sim":0.81}
+ ],
+ "model": {"model_name":"gpt-4o-mini","tokens_input":420,"tokens_output":108,"latency_ms":512},
+ "tool_calls":[
+   {"tool":"inventory_check","start":"...","end":"...","status":"200","result":"available"}
+ ],
+ "response":"{...}",
+ "memory_hits":["mem_20240412_ORD12345"],
+ "verifier":{"support_score":0.92},
+ "cost_micros": 12345
+}
+```
+
+We persisted traces to an append-only log store (BigQuery partitioned by date) for audits.”
+
+---
+
+# PART H — Troubleshooting & incident questions
+
+**Q21.** Tell me about an incident where memory index corrupted. How did you detect it and what was your rollback?
+
+**Best answer:**
+“Incident: After a model upgrade, we saw a spike in `embedding_failure_rate` and `memory_retrieval_errors`. Detection: consumer errors in the index service and end-user reports of nonsense answers. Investigation found index file corruption due to incompatible FAISS version during a rolling upgrade (missing mmap flag). Rollback: we switched traffic to read-only fallback index snapshot taken every 12 hours; disabled compaction pipeline; restored last good FAISS snapshot from GCS; ran integrity checksum; re-opened reads after smoke tests. On the ops side we enforced version pinning and added pre-upgrade integration tests.”
+
+---
+
+**Q22.** If a cross-tenant data leakage alarm fires, what concrete steps do you take in the first 60 minutes?
+
+**Best answer:**
+“1. Immediately set service to `maintenance_mode` to stop all writes and optionally reads (based on severity).
+2. Rotate access keys for affected services and revoke tokens.
+3. Query audit logs to identify the read/write that caused leakage (using `request_id` and `index_namespace`).
+4. Isolate the compromised index/replica and create a forensic snapshot to a secure bucket.
+5. Notify legal/compliance and start DSAR procedures if PII involved.
+6. Communicate to affected tenant(s) within SLA timelines.
+Post-60min: create remediation plan, patch root cause, and perform a full security review.”
+
+---
+
+# PART I — Design rationale, trade-offs & metrics
+
+**Q23.** Why choose nightly compaction rather than continuous streaming compaction? Provide cost/latency trade-offs and the numbers you observed.
+
+**Best answer:**
+“Nightly compaction was chosen because streaming compaction increases CPU and embedding costs and risks contention with real-time ingestion. Numbers: streaming compaction would consume ~50% extra CPU and increase indexing cost by 27% due to frequent re-embedding. Nightly compaction (2am window) reduced peak load and gave a 63% storage reduction observed in telecom case. Streaming is useful for extremely low-latency use-cases; but for our SLAs, nightly was cost-optimal.”
+
+---
+
+**Q24.** Explain the decision to use TTL + versioning vs keeping an append-only memory store.
+
+**Best answer:**
+“Append-only simplifies audits but increases storage and retrieval noise. TTL + versioning gives control over relevance and cost: TTL handles ephemeral user session data; versioning helps rollback and traceability. For regulatory archives we kept append-only on cold storage (GCS) with an index pointer in the active store referencing the archive. This hybrid retained auditability without bloating the active vector index.”
+
+---
+
+# PART J — Behavioral & verification questions to confirm hands-on work
+
+**Q25.** Show me a shell command or snippet you’d run to reindex FAISS from compressed summary files.
+
+**Best answer:**
+“Example snippet:
+
+```bash
+# run on a worker VM with access to GCS and FAISS libs
+python reindex_faiss.py \
+  --input_gcs_bucket gs://memories/compacted/2025-04-01/ \
+  --index_out /mnt/indexes/faiss_compacted.idx \
+  --batch_size 2000 \
+  --embedding_model local_embedder_v2 \
+  --log_table project.dataset.index_audit
+```
+
+`reindex_faiss.py` reads JSON summaries, computes vectors (if not precomputed), and writes FAISS index shards with checksums and an audit row per batch. This was the exact pattern we used in production.”
+
+---
+
+**Q26.** Give a sample alert message you’d get in Slack when compaction job fails including fields.
+
+**Best answer:**
+“Slack alert text:
+
+```
+:warning: *Compaction Job FAILED* (job_id: comp-20250421-12)
+Tenant: OEM_A
+Index: faiss_order_analyst
+Error: OOM in batch 48
+BatchSize: 2000
+FailedAt: 2025-04-21T02:14:03Z
+Action: /ops/run-reindex comp-20250421-12 --resume_token=48
+Link: https://console.company.com/jobs/comp-20250421-12
+```
+
+We included runbook link and one-click actions to open an incident in PagerDuty or re-run with adjusted batch size.”
+
+---
+
+**Q27.** How did you convince stakeholders to accept memory TTL (and potential loss of recall) for privacy? What evidence did you present?
+
+**Best answer:**
+“We ran a risk/benefit pilot: two cohorts (A: TTL 90 days, B: no TTL). We tracked UX metrics (session continuity, NPS) and risk metrics (PII exposures, audit hits). Results: UX drop was negligible (~0.7% NPS) while privacy risk exposure decreased by 93%. We showed cost savings from smaller indices and a compliance sign-off. The empirical data (numbers) convinced legal to accept TTL with opt-in extended retention under consent.”
+
+---
+
+# PART K — Rapid-fire technical validation (short checks)
+
+**Q28.** How do you make retrieval deterministic for testing? (One-sentence answer expected)
+
+**Best answer:**
+“Pin model versions, seed any nondeterministic ranking, use deterministic embedding model (or cache embeddings), and use fixed random seed on any reranking/hybrid procedure.”
+
+---
+
+**Q29.** What backup strategy for FAISS index did you use? (list backups and retention)
+
+**Best answer:**
+“Three-tier backup: hourly incremental snapshots (retain 24h), daily full backups (retain 14 days), weekly cold snapshots to cold storage (retain 90 days). Snapshots included index + metadata + checksum; restoration tested monthly.”
+
+---
+
+**Q30.** How did you load-test memory retrieval at scale? Provide the tool & a sample load shape.
+
+**Best answer:**
+“We used k6 for load tests generating realistic query distributions (70% repeat queries, 30% novel). Load shape: ramp to 2,000 QPS over 10 minutes, sustain 30 minutes, spike to 5,000 QPS for 1 minute. We measured 95th percentile latency and tail errors; this validated autoscaling rules.”
+
+---
+
+# PART L — Final verification & closing probes (to make sure they really did it)
+
+**Q31.** Give the git commit title and the top-line changes for the PR where you implemented namespace isolation for agents.
+
+**Best answer:**
+“PR title: `feat(memory): add agent-scoped namespaces + metadata-filter retriever (#412)`
+Top-line changes: added `memory_namespace` table, updated `memory_service.write()` to accept `namespace` param, added filter propagation in `retriever.query()`, unit tests for namespace ACLs, updated infra terraform to create per-namespace index resources. Link: `gitlab.com/org/repo/-/merge_requests/412`.”
+
+---
+
+**Q32.** Who reviewed that PR and what was the major comment they raised? (behavioral check)
+
+**Best answer:**
+“Reviewed by `arch_lead_jp`. Major comment: ‘Need to ensure cross-tenant performance when orchestrator fetches multiple namespaces — implement fan-in timeout and circuit-breaker’ — we implemented a 600ms fan-in and resilience policy.”
+
+---
+
+**Q33.** If I asked your SRE to show me the Grafana dashboard for memory subsystem, what panel would you show first?
+
+**Best answer:**
+“The `Memory Retrieval Overview` panel showing `avg_retrieval_latency`, `cache_hit_rate`, and `index_size_gb` over last 24h with single-click drilldown into per-tenant latency. This gives immediate health and capacity signal.”
+
+
 
 
